@@ -58,6 +58,10 @@ def get_or_load_pipe(
         model_id,
         torch_dtype=dtype,
     )
+    try:
+        pipe._glm_cache_key = key
+    except Exception:
+        pass
 
     # SDNQ: INT8 matmul (if Triton is available and running on CUDA/XPU)
     if (
@@ -115,6 +119,21 @@ def _comfy_image_to_pil(image_tensor):
 
 
 def _release_pipe(pipe):
+    try:
+        key = getattr(pipe, "_glm_cache_key", None)
+        if key is not None:
+            _PIPE_CACHE.pop(key, None)
+    except Exception:
+        pass
+    try:
+        if hasattr(pipe, "to"):
+            pipe.to("cpu")
+        elif hasattr(pipe, "components"):
+            for comp in pipe.components.values():
+                if hasattr(comp, "to"):
+                    comp.to("cpu")
+    except Exception:
+        pass
     try:
         del pipe
     except Exception:
@@ -191,6 +210,7 @@ class GLMImageSDNQ_Generate:
                     {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1},
                 ),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "unload": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -200,7 +220,7 @@ class GLMImageSDNQ_Generate:
     CATEGORY = "GLM-Image-SDNQ"
 
     @torch.inference_mode()
-    def generate(self, pipe, prompt, width, height, steps, guidance_scale, seed):
+    def generate(self, pipe, prompt, width, height, steps, guidance_scale, seed, unload):
         gen_device = "cpu"
         if torch.cuda.is_available():
             gen_device = "cuda"
@@ -220,6 +240,8 @@ class GLMImageSDNQ_Generate:
 
         pil_img = out.images[0]
         comfy_img = pil_to_comfy_image(pil_img)
+        if unload:
+            _release_pipe(pipe)
         return (comfy_img,)
 
 
@@ -241,6 +263,7 @@ class GLMImageSDNQ_ImageToImage:
                 "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
                 "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "unload": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -250,7 +273,7 @@ class GLMImageSDNQ_ImageToImage:
     CATEGORY = "GLM-Image-SDNQ"
 
     @torch.inference_mode()
-    def edit(self, pipe, image, prompt, width, height, steps, guidance_scale, seed):
+    def edit(self, pipe, image, prompt, width, height, steps, guidance_scale, seed, unload):
         # IMAGE в ComfyUI: [B,H,W,C] float32 0..1
         img0 = image[0].detach().cpu().numpy()
         img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -279,6 +302,8 @@ class GLMImageSDNQ_ImageToImage:
             generator=generator,
         )
         pil_img = out.images[0]
+        if unload:
+            _release_pipe(pipe)
         return (pil_to_comfy_image(pil_img),)
 
 
@@ -298,6 +323,7 @@ class GLMImageSDNQ_MultiImageToImage:
                 "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
                 "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "unload": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -307,7 +333,7 @@ class GLMImageSDNQ_MultiImageToImage:
     CATEGORY = "GLM-Image-SDNQ"
 
     @torch.inference_mode()
-    def edit(self, pipe, image_a, image_b, prompt, width, height, steps, guidance_scale, seed):
+    def edit(self, pipe, image_a, image_b, prompt, width, height, steps, guidance_scale, seed, unload):
         def to_pil(img_tensor):
             img0 = img_tensor[0].detach().cpu().numpy()
             img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -338,6 +364,8 @@ class GLMImageSDNQ_MultiImageToImage:
             generator=generator,
         )
         pil_img = out.images[0]
+        if unload:
+            _release_pipe(pipe)
         return (pil_to_comfy_image(pil_img),)
 
 
@@ -355,6 +383,7 @@ class GLMImageSDNQ_FlexibleInput:
                 "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
                 "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "unload": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "image_a": ("IMAGE",),
@@ -368,7 +397,7 @@ class GLMImageSDNQ_FlexibleInput:
     CATEGORY = "GLM-Image-SDNQ"
 
     @torch.inference_mode()
-    def run(self, pipe, prompt, width, height, steps, guidance_scale, seed, image_a=None, image_b=None):
+    def run(self, pipe, prompt, width, height, steps, guidance_scale, seed, unload, image_a=None, image_b=None):
         def to_pil(img_tensor):
             img0 = img_tensor[0].detach().cpu().numpy()
             img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -405,6 +434,8 @@ class GLMImageSDNQ_FlexibleInput:
 
         out = pipe(**kwargs)
         pil_img = out.images[0]
+        if unload:
+            _release_pipe(pipe)
         return (pil_to_comfy_image(pil_img),)
 
 
