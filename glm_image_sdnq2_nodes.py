@@ -45,9 +45,10 @@ def get_or_load_pipe(
     device_name: str,
     cpu_offload: bool,
     quantized_matmul: bool,
+    use_cache: bool = True,
 ):
     key = (model_id, dtype_name, device_name, cpu_offload, quantized_matmul)
-    if key in _PIPE_CACHE:
+    if use_cache and key in _PIPE_CACHE:
         return _PIPE_CACHE[key]
 
     dtype = pick_dtype(dtype_name)
@@ -85,8 +86,49 @@ def get_or_load_pipe(
     if hasattr(pipe, "enable_attention_slicing"):
         pipe.enable_attention_slicing()
 
-    _PIPE_CACHE[key] = pipe
+    if use_cache:
+        _PIPE_CACHE[key] = pipe
     return pipe
+
+
+def _pick_gen_device(device_name=None):
+    if device_name == "cuda" and torch.cuda.is_available():
+        return "cuda"
+    if device_name == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    if device_name is None:
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+    return "cpu"
+
+
+def _comfy_image_to_pil(image_tensor):
+    img0 = image_tensor[0].detach().cpu().numpy()
+    img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
+    if img0.shape[-1] == 4:
+        img0 = img0[..., :3]
+    from PIL import Image as PILImage
+
+    return PILImage.fromarray(img0, mode="RGB")
+
+
+def _release_pipe(pipe):
+    try:
+        del pipe
+    except Exception:
+        pass
+    try:
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, "xpu") and hasattr(torch.xpu, "empty_cache"):
+            torch.xpu.empty_cache()
+    except Exception:
+        pass
 
 
 class GLMImageSDNQ_LoadPipe:
@@ -366,10 +408,234 @@ class GLMImageSDNQ_FlexibleInput:
         return (pil_to_comfy_image(pil_img),)
 
 
+class GLMImageSDNQ_T2I_Standalone:
+    "Text-to-image with internal pipeline load."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"multiline": True, "default": "A cute cat"}),
+                "width": ("INT", {"default": 1152, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "model_id": ("STRING", {"default": "Disty0/GLM-Image-SDNQ-4bit-dynamic"}),
+                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+                "device": (["cuda", "xpu", "cpu"], {"default": "cuda"}),
+                "cpu_offload": ("BOOLEAN", {"default": True}),
+                "quantized_matmul": ("BOOLEAN", {"default": True}),
+                "unload": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "generate"
+    CATEGORY = "GLM-Image-SDNQ/Standalone"
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt,
+        width,
+        height,
+        steps,
+        guidance_scale,
+        seed,
+        model_id,
+        dtype,
+        device,
+        cpu_offload,
+        quantized_matmul,
+        unload,
+    ):
+        pipe = get_or_load_pipe(
+            model_id=model_id,
+            dtype_name=dtype,
+            device_name=device,
+            cpu_offload=cpu_offload,
+            quantized_matmul=quantized_matmul,
+            use_cache=False,
+        )
+
+        generator = torch.Generator(device=_pick_gen_device(device)).manual_seed(int(seed))
+
+        out = pipe(
+            prompt=prompt,
+            height=int(height),
+            width=int(width),
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+
+        pil_img = out.images[0]
+        comfy_img = pil_to_comfy_image(pil_img)
+        if unload:
+            _release_pipe(pipe)
+        return (comfy_img,)
+
+
+class GLMImageSDNQ_I2I_Standalone:
+    "Image-to-image with internal pipeline load."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": "Replace the background with ..."}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "model_id": ("STRING", {"default": "Disty0/GLM-Image-SDNQ-4bit-dynamic"}),
+                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+                "device": (["cuda", "xpu", "cpu"], {"default": "cuda"}),
+                "cpu_offload": ("BOOLEAN", {"default": True}),
+                "quantized_matmul": ("BOOLEAN", {"default": True}),
+                "unload": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "edit"
+    CATEGORY = "GLM-Image-SDNQ/Standalone"
+
+    @torch.inference_mode()
+    def edit(
+        self,
+        image,
+        prompt,
+        width,
+        height,
+        steps,
+        guidance_scale,
+        seed,
+        model_id,
+        dtype,
+        device,
+        cpu_offload,
+        quantized_matmul,
+        unload,
+    ):
+        pipe = get_or_load_pipe(
+            model_id=model_id,
+            dtype_name=dtype,
+            device_name=device,
+            cpu_offload=cpu_offload,
+            quantized_matmul=quantized_matmul,
+            use_cache=False,
+        )
+
+        generator = torch.Generator(device=_pick_gen_device(device)).manual_seed(int(seed))
+        pil = _comfy_image_to_pil(image)
+
+        out = pipe(
+            prompt=prompt,
+            image=[pil],
+            height=int(height),
+            width=int(width),
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+
+        pil_img = out.images[0]
+        comfy_img = pil_to_comfy_image(pil_img)
+        if unload:
+            _release_pipe(pipe)
+        return (comfy_img,)
+
+
+class GLMImageSDNQ_MultiI2I_Standalone:
+    "Multi-image-to-image with internal pipeline load."
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": "Replace the background with ..."}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+                "model_id": ("STRING", {"default": "Disty0/GLM-Image-SDNQ-4bit-dynamic"}),
+                "dtype": (["bf16", "fp16", "fp32"], {"default": "bf16"}),
+                "device": (["cuda", "xpu", "cpu"], {"default": "cuda"}),
+                "cpu_offload": ("BOOLEAN", {"default": True}),
+                "quantized_matmul": ("BOOLEAN", {"default": True}),
+                "unload": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "edit"
+    CATEGORY = "GLM-Image-SDNQ/Standalone"
+
+    @torch.inference_mode()
+    def edit(
+        self,
+        image_a,
+        image_b,
+        prompt,
+        width,
+        height,
+        steps,
+        guidance_scale,
+        seed,
+        model_id,
+        dtype,
+        device,
+        cpu_offload,
+        quantized_matmul,
+        unload,
+    ):
+        pipe = get_or_load_pipe(
+            model_id=model_id,
+            dtype_name=dtype,
+            device_name=device,
+            cpu_offload=cpu_offload,
+            quantized_matmul=quantized_matmul,
+            use_cache=False,
+        )
+
+        generator = torch.Generator(device=_pick_gen_device(device)).manual_seed(int(seed))
+        pil_a = _comfy_image_to_pil(image_a)
+        pil_b = _comfy_image_to_pil(image_b)
+
+        out = pipe(
+            prompt=prompt,
+            image=[pil_a, pil_b],
+            height=int(height),
+            width=int(width),
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+
+        pil_img = out.images[0]
+        comfy_img = pil_to_comfy_image(pil_img)
+        if unload:
+            _release_pipe(pipe)
+        return (comfy_img,)
+
+
 NODE_CLASS_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": GLMImageSDNQ_ImageToImage,
     "GLMImageSDNQ_MultiImageToImage": GLMImageSDNQ_MultiImageToImage,
     "GLMImageSDNQ_FlexibleInput": GLMImageSDNQ_FlexibleInput,
+    "GLMImageSDNQ_T2I_Standalone": GLMImageSDNQ_T2I_Standalone,
+    "GLMImageSDNQ_I2I_Standalone": GLMImageSDNQ_I2I_Standalone,
+    "GLMImageSDNQ_MultiI2I_Standalone": GLMImageSDNQ_MultiI2I_Standalone,
     "GLMImageSDNQ_LoadPipe": GLMImageSDNQ_LoadPipe,
     "GLMImageSDNQ_Generate": GLMImageSDNQ_Generate,
 }
@@ -378,6 +644,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": "GLM-Image SDNQ 4bit: Image to Image",
     "GLMImageSDNQ_MultiImageToImage": "GLM-Image SDNQ 4bit: Multi Image to Image",
     "GLMImageSDNQ_FlexibleInput": "GLM-Image SDNQ 4bit: Flexible (0-2 Images)",
+    "GLMImageSDNQ_T2I_Standalone": "GLM-Image SDNQ 4bit: T2I (Standalone)",
+    "GLMImageSDNQ_I2I_Standalone": "GLM-Image SDNQ 4bit: I2I (Standalone)",
+    "GLMImageSDNQ_MultiI2I_Standalone": "GLM-Image SDNQ 4bit: Multi I2I (Standalone)",
     "GLMImageSDNQ_LoadPipe": "GLM-Image SDNQ 4bit: Load Pipe",
     "GLMImageSDNQ_Generate": "GLM-Image SDNQ 4bit: Generate",
 }
