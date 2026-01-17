@@ -299,9 +299,77 @@ class GLMImageSDNQ_MultiImageToImage:
         return (pil_to_comfy_image(pil_img),)
 
 
+class GLMImageSDNQ_FlexibleInput:
+    """Generate with 0-2 input images."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipe": ("GLM_PIPE",),
+                "prompt": ("STRING", {"multiline": True, "default": "Replace the background with ..."}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "run"
+    CATEGORY = "GLM-Image-SDNQ"
+
+    @torch.inference_mode()
+    def run(self, pipe, prompt, width, height, steps, guidance_scale, seed, image_a=None, image_b=None):
+        def to_pil(img_tensor):
+            img0 = img_tensor[0].detach().cpu().numpy()
+            img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if img0.shape[-1] == 4:
+                img0 = img0[..., :3]
+            from PIL import Image as PILImage
+
+            return PILImage.fromarray(img0, mode="RGB")
+
+        images = []
+        if image_a is not None:
+            images.append(to_pil(image_a))
+        if image_b is not None:
+            images.append(to_pil(image_b))
+
+        gen_device = "cpu"
+        if torch.cuda.is_available():
+            gen_device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            gen_device = "xpu"
+
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+
+        kwargs = {
+            "prompt": prompt,
+            "height": int(height),
+            "width": int(width),
+            "num_inference_steps": int(steps),
+            "guidance_scale": float(guidance_scale),
+            "generator": generator,
+        }
+        if images:
+            kwargs["image"] = images
+
+        out = pipe(**kwargs)
+        pil_img = out.images[0]
+        return (pil_to_comfy_image(pil_img),)
+
+
 NODE_CLASS_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": GLMImageSDNQ_ImageToImage,
     "GLMImageSDNQ_MultiImageToImage": GLMImageSDNQ_MultiImageToImage,
+    "GLMImageSDNQ_FlexibleInput": GLMImageSDNQ_FlexibleInput,
     "GLMImageSDNQ_LoadPipe": GLMImageSDNQ_LoadPipe,
     "GLMImageSDNQ_Generate": GLMImageSDNQ_Generate,
 }
@@ -309,6 +377,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": "GLM-Image SDNQ 4bit: Image to Image",
     "GLMImageSDNQ_MultiImageToImage": "GLM-Image SDNQ 4bit: Multi Image to Image",
+    "GLMImageSDNQ_FlexibleInput": "GLM-Image SDNQ 4bit: Flexible (0-2 Images)",
     "GLMImageSDNQ_LoadPipe": "GLM-Image SDNQ 4bit: Load Pipe",
     "GLMImageSDNQ_Generate": "GLM-Image SDNQ 4bit: Generate",
 }
