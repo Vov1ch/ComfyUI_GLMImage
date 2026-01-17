@@ -240,14 +240,75 @@ class GLMImageSDNQ_ImageToImage:
         return (pil_to_comfy_image(pil_img),)
 
 
+class GLMImageSDNQ_MultiImageToImage:
+    """Image-to-Image with two input images."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "pipe": ("GLM_PIPE",),
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "default": "Replace the background with ..."}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 32}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
+                "guidance_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 30.0, "step": 0.1}),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**31 - 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "edit"
+    CATEGORY = "GLM-Image-SDNQ"
+
+    @torch.inference_mode()
+    def edit(self, pipe, image_a, image_b, prompt, width, height, steps, guidance_scale, seed):
+        def to_pil(img_tensor):
+            img0 = img_tensor[0].detach().cpu().numpy()
+            img0 = (np.clip(img0, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if img0.shape[-1] == 4:
+                img0 = img0[..., :3]
+            from PIL import Image as PILImage
+
+            return PILImage.fromarray(img0, mode="RGB")
+
+        pil_a = to_pil(image_a)
+        pil_b = to_pil(image_b)
+
+        gen_device = "cpu"
+        if torch.cuda.is_available():
+            gen_device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            gen_device = "xpu"
+
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
+
+        out = pipe(
+            prompt=prompt,
+            image=[pil_a, pil_b],
+            height=int(height),
+            width=int(width),
+            num_inference_steps=int(steps),
+            guidance_scale=float(guidance_scale),
+            generator=generator,
+        )
+        pil_img = out.images[0]
+        return (pil_to_comfy_image(pil_img),)
+
+
 NODE_CLASS_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": GLMImageSDNQ_ImageToImage,
+    "GLMImageSDNQ_MultiImageToImage": GLMImageSDNQ_MultiImageToImage,
     "GLMImageSDNQ_LoadPipe": GLMImageSDNQ_LoadPipe,
     "GLMImageSDNQ_Generate": GLMImageSDNQ_Generate,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GLMImageSDNQ_ImageToImage": "GLM-Image SDNQ 4bit: Image to Image",
+    "GLMImageSDNQ_MultiImageToImage": "GLM-Image SDNQ 4bit: Multi Image to Image",
     "GLMImageSDNQ_LoadPipe": "GLM-Image SDNQ 4bit: Load Pipe",
     "GLMImageSDNQ_Generate": "GLM-Image SDNQ 4bit: Generate",
 }
